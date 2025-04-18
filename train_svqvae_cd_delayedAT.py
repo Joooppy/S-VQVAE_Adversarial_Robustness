@@ -1,0 +1,467 @@
+"""
+DelayedAT adversarial training process including class divergence loss: 
+margin-based approach with ramp
+margins and learning rate change after switch to adversarial training.
+"""
+
+import argparse
+import os
+import csv
+import torch
+import matplotlib.pyplot as plt
+from torch import nn, optim
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets, transforms
+from tqdm import tqdm
+import distributed as dist
+from models.s_vqvae_emb256 import S_VQVAE   ### adjust for respective model
+from scheduler import CycleScheduler
+from sklearn.model_selection import train_test_split
+
+# adversarial perturbation PGD-k
+def pgd_attack(model, images, labels, epsilon=8/255, alpha=2/255, n_iter=10):
+    perturbed_images = images.clone().detach()
+    perturbed_images.requires_grad_(True)  
+    
+    for _ in range(n_iter):
+        output = model(perturbed_images)[2]  # Logits
+        loss = F.cross_entropy(output, labels)
+        
+        model.zero_grad()  
+        loss.backward()
+
+        with torch.no_grad():
+            perturbed_images += alpha * perturbed_images.grad.sign()
+            perturbation = torch.clamp(perturbed_images - images, min=-epsilon, max=epsilon)
+            perturbed_images = torch.clamp(images + perturbation, min=-1, max=1).detach()
+            perturbed_images.requires_grad_(True)  
+
+    return perturbed_images
+
+# class divergence loss function
+def class_divergence_loss(
+    embed_code,
+    labels,
+    num_classes,
+    device,
+    margin_intra=0.75,   # max margin allowed intra-class distance
+    margin_inter=2.0,   # min margin required inter-class distance
+    epsilon=1e-5
+):
+    """
+    Margin-based class divergence:
+      - Intra-class margin (margin_intra): 
+          If class's avg distance from centroid > margin_intra: penalize the excess
+      - Inter-class margin (margin_inter):
+          If distance between two class centroids < margin_inter: penalize the shortfall
+
+    Args:
+        embed_code: Tensor of shape (B, C, H, W). 
+                    We'll average over spatial dims to get shape (B, C).
+        labels: Long tensor of shape (B,) with class indices
+        num_classes: number of classes (e.g. 10 for CIFAR-10)
+        device: 'cpu' or 'cuda'
+        margin_intra: float, desired maximum intra-class distance
+        margin_inter: float, desired minimum inter-class distance
+
+    Returns:
+        A scalar margin-based penalty that is 0 if all classes are 
+        within margin_intra of their centroid, and all centroids are at 
+        least margin_inter apart. Otherwise it grows with the violation amount.
+    """
+    
+    B, C, H, W = embed_code.shape
+    # flatten the spatial dims and average to get a single vector per sample
+    embed_code_flat = embed_code.view(B, C, -1).mean(dim=2)  # (B, C)
+
+    # compute each class centroid
+    class_centroids = torch.zeros(num_classes, C, device=device)
+    class_counts = torch.zeros(num_classes, device=device)
+
+    for i in range(num_classes):
+        mask = (labels == i)
+        if mask.sum() > 0:
+            class_centroids[i] = embed_code_flat[mask].mean(dim=0)
+            class_counts[i] = mask.sum()
+
+    valid_classes = (class_counts > 0)
+
+    # intra-class penalty
+    intra_class_loss = 0.0
+    # inter-class penalty
+    inter_class_loss = 0.0
+
+    
+    for i in range(num_classes):
+        mask_i = (labels == i)
+        if mask_i.sum() == 0:
+            continue 
+
+        # average distance from each sample to centroid
+        dist_intra = ((embed_code_flat[mask_i] - class_centroids[i]) ** 2).mean()
+
+        intra_class_loss += F.relu(dist_intra - margin_intra)
+
+    # inter class distances
+    # compare centroids pairwise
+    for i in range(num_classes):
+        if not valid_classes[i]:
+            continue
+        for j in range(i + 1, num_classes):
+            if not valid_classes[j]:
+                continue
+
+            dist_inter = ((class_centroids[i] - class_centroids[j]) ** 2).mean()
+            inter_class_loss += F.relu(margin_inter - dist_inter)
+
+    total_loss = intra_class_loss + inter_class_loss
+    return total_loss
+
+def get_ramped_gamma(epoch, gamma, ramp_start=0, ramp_epochs=10):
+    """
+    Returns a scaled version of gamma that starts at 0 
+    and linearly ramps up to gamma over ramp_epochs.
+    """
+    if epoch < ramp_start:
+        # before ramp start: gamma = 0
+        return 0.0
+    elif epoch >= ramp_start + ramp_epochs:
+        # past the ramp window, full gamma value
+        return gamma
+    else:
+        # scales linearly during ramp
+        progress = (epoch - ramp_start) / float(ramp_epochs)
+        return gamma * progress
+
+def train(epoch,
+          loader,
+          model,
+          optimizer,
+          scheduler,
+          device,
+          clip_grad_main=5.0,
+          clip_grad_diverg=1.0,
+          alpha=0.5,
+          beta=0.25,
+          gamma=0.1,
+          ramp_start=0,
+          ramp_epochs=10,
+          use_adversarial=False):
+    """
+    Args:
+        epoch (int): current epoch index
+        loader (DataLoader): training data loader
+        model (nn.Module)
+        optimizer (torch.optim.Optimizer)
+        scheduler: optional learning rate scheduler
+        device (str): 'cpu' or 'cuda'
+        clip_grad_main (float): gradient-norm clip for main losses
+        clip_grad_diverg (float): gradient-norm clip for divergence loss
+        alpha, beta: weighting factors for S-VQVAE losses
+        base_gamma (float): maximum gamma for class divergence
+        ramp_start, ramp_epochs: when and how fast to ramp gamma
+        use_adversarial: whether in adversarial training mode
+    """   
+    # adjust hyperparams dynamically after switching to AT
+    if use_adversarial:
+        lr = 5e-5  # reduced learning rate
+        margin_intra = 0.75  # slightly relaxed
+        margin_inter = 2.0   # stricter separation
+        clip_grad_main = 3.0
+        clip_grad_diverg = 0.5
+    else:
+        lr = args.lr
+        margin_intra = 0.5
+        margin_inter = 1.5
+        clip_grad_main = args.clip_grad_main
+        clip_grad_diverg = args.clip_grad_diverg
+
+    # update optimizer learning rate dynamically
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+    
+    # get the current ramped gamma for epoch
+    gamma_ramped = get_ramped_gamma(epoch, gamma, ramp_start, ramp_epochs)
+    
+    if dist.is_primary():
+        loader = tqdm(loader)
+
+    recon_criterion = nn.MSELoss()
+    class_criterion = nn.CrossEntropyLoss()
+
+    mse_sum, codebook_sum, commit_sum, class_loss_sum, divergence_sum, total_loss_sum = 0, 0, 0, 0, 0, 0
+    mse_n = 0
+
+    model.train()
+
+    for img, label in loader:
+        img, label = img.to(device), label.to(device)
+
+        if use_adversarial:
+            img = pgd_attack(model, img, label)
+        
+        # forward pass
+        recon, latent_loss, logits = model(img)
+        quant, diff, embed_ind = model.encode(img)
+        embed_code = model.quantize.embed_code(embed_ind).permute(0, 3, 1, 2)
+        embed_code.requires_grad_(True)
+   
+        # compute losses
+        recon_loss = recon_criterion(recon, img)
+        codebook_loss = ((quant.detach() - embed_code) ** 2).mean()
+        commitment_loss = beta * ((quant - embed_code.detach()) ** 2).mean()
+        class_loss = class_criterion(logits, label)
+        
+        # divergence loss
+        raw_divergence_loss = class_divergence_loss(embed_code, label, num_classes=10, device=device, margin_intra=margin_intra, margin_inter=margin_inter)
+              
+        main_loss = alpha * (recon_loss + codebook_loss + commitment_loss) + (1 - alpha) * class_loss
+        divergence_loss = gamma_ramped * raw_divergence_loss
+        
+        optimizer.zero_grad()
+        main_loss.backward(retain_graph=True)
+
+        if clip_grad_main is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_main)
+
+        divergence_loss.backward()
+        
+        if clip_grad_diverg is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_diverg)
+        
+        optimizer.step()
+        
+        if scheduler is not None:
+            scheduler.step()
+
+        # accumulate losses
+        total_loss = main_loss.item() + divergence_loss.item()
+        batch_size = img.shape[0]
+
+        mse_sum         += recon_loss.item()       * batch_size
+        codebook_sum    += codebook_loss.item()    * batch_size
+        commit_sum      += commitment_loss.item()  * batch_size
+        class_loss_sum  += class_loss.item()       * batch_size
+        divergence_sum  += raw_divergence_loss.item()  * batch_size
+        total_loss_sum  += total_loss              * batch_size
+        mse_n           += batch_size
+
+    return {
+        "recon_loss": mse_sum / mse_n,
+        "codebook_loss": codebook_sum / mse_n,
+        "commitment_loss": commit_sum / mse_n,
+        "class_loss": class_loss_sum / mse_n,
+        "divergence_loss": divergence_sum / mse_n,
+        "total_loss": total_loss_sum / mse_n,
+    }
+
+# validation function
+def validate(loader, model, device, alpha=0.5, beta=0.25, gamma=0.1, use_adversarial=False):
+    model.eval()
+    recon_criterion = nn.MSELoss()
+    class_criterion = nn.CrossEntropyLoss()
+    
+    mse_sum, codebook_sum, commit_sum, class_loss_sum, divergence_sum, total_loss_sum = 0, 0, 0, 0, 0, 0
+    mse_n = 0
+    
+    with torch.no_grad():
+        for img, label in loader:
+            img, label = img.to(device), label.to(device)
+            
+            if use_adversarial:
+                img.requires_grad = True
+                with torch.enable_grad():
+                    img = pgd_attack(model, img, label)
+            
+            recon, latent_loss, logits = model(img)
+            quant, diff, embed_ind = model.encode(img)
+            embed_code = model.quantize.embed_code(embed_ind).permute(0, 3, 1, 2)
+
+            # Compute losses
+            recon_loss = recon_criterion(recon, img)
+            codebook_loss = ((quant.detach() - embed_code) ** 2).mean()
+            commitment_loss = beta * ((quant - embed_code.detach()) ** 2).mean()
+            class_loss = class_criterion(logits, label)
+            raw_divergence_loss = class_divergence_loss(embed_code, label, num_classes=10, device=device)
+
+            total_loss = alpha * (recon_loss + codebook_loss + commitment_loss) \
+                         + (1 - alpha) * class_loss \
+                         + gamma * raw_divergence_loss
+            
+            # Accumulate losses
+            mse_sum += recon_loss.item() * img.shape[0]
+            codebook_sum += codebook_loss.item() * img.shape[0]
+            commit_sum += commitment_loss.item() * img.shape[0]
+            class_loss_sum += class_loss.item() * img.shape[0]
+            divergence_sum += raw_divergence_loss.item() * img.shape[0]
+            total_loss_sum += total_loss.item() * img.shape[0]
+            mse_n += img.shape[0]
+    
+    return {
+        "recon_loss": mse_sum / mse_n,
+        "codebook_loss": codebook_sum / mse_n,
+        "commitment_loss": commit_sum / mse_n,
+        "class_loss": class_loss_sum / mse_n,
+        "divergence_loss": divergence_sum / mse_n,
+        "total_loss": total_loss_sum / mse_n,
+    }
+
+def main(args):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    args.distributed = dist.get_world_size() > 1
+
+    os.makedirs("logs", exist_ok=True)
+    os.makedirs("best_model", exist_ok=True)
+
+    # log training process
+    log_file = "logs/training_loss_cd_delayedAT_emb256.csv"
+
+    if dist.is_primary():
+        with open(log_file, "w") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Epoch", "Train Total Loss", "Train Recon Loss", "Train Codebook Loss", "Train Commitment Loss", "Train Class Loss", "Train Divergence Loss"
+                             "Val Total Loss", "Val Recon Loss", "Val Codebook Loss", "Val Commitment Loss", "Val Class Loss", "Val Divergence Loss"
+                             "Adv Val Total Loss", "Adv Val Recon Loss", "Adv Val Codebook Loss", "Adv Val Commitment Loss", "Adv Val Class Loss", "Adv Val Divergence Loss"])
+
+
+    transform = transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomRotation(15),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+    ])
+
+    dataset = datasets.CIFAR10(root=args.path, train=True, download=True, transform=transform)
+    targets = dataset.targets  
+
+    # stratified 80/20 split
+    train_indices, val_indices = train_test_split(
+        range(len(dataset)), test_size=0.2, stratify=targets, random_state=42
+    )
+
+    train_dataset = Subset(dataset, train_indices)
+    val_dataset = Subset(dataset, val_indices)
+
+    train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True, num_workers=2)
+    val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False, num_workers=2)
+
+    # instantiate model
+    model = S_VQVAE().to(device)
+
+    # separate weight-decay and no-decay for unsuitable and unnecessary weights for decay
+    decay, no_decay = [], []
+    for name, param in model.named_parameters():
+        if "weight" in name and "bn" not in name:
+            decay.append(param)
+        else:
+            no_decay.append(param)
+
+    optimizer = optim.Adam(
+        [{"params": decay, "weight_decay": 1e-4}, {"params": no_decay, "weight_decay": 0.0}],
+        lr=args.lr,
+    )
+    
+    # optional scheduler
+    scheduler = CycleScheduler(optimizer, args.lr, n_iter=len(train_loader) * args.epoch) if args.sched == "cycle" else None
+
+    best_val_loss = float('inf')
+    best_combined_val_loss = float('inf')
+    
+    # patience counter for early stopping
+    patience = 100
+    patience_counter = 0
+    
+    moving_avg_loss, switch_point_detected = None, False
+    
+    losses = {"recon_loss": [], 
+              "codebook_loss": [], 
+              "commitment_loss": [], 
+              "class_loss": [], 
+              "divergence_loss": [], 
+              "total_loss": []}
+
+    for epoch in range(args.epoch):
+        train_loss = train(epoch, train_loader, model, optimizer, scheduler, device, clip_grad_main=args.clip_grad_main, clip_grad_diverg=args.clip_grad_diverg, alpha=args.alpha, beta=args.beta, gamma=args.gamma, ramp_start=args.ramp_start, ramp_epochs=args.ramp_epochs, use_adversarial=switch_point_detected)
+        val_loss = validate(val_loader, model, device, alpha=args.alpha, beta=args.beta, gamma=args.gamma, use_adversarial=False)
+        adv_val_loss = validate(val_loader, model, device, alpha=args.alpha, beta=args.beta, gamma=args.gamma,  use_adversarial=True) if switch_point_detected else None
+        combined_val_loss = val_loss["total_loss"] + (adv_val_loss["total_loss"] if adv_val_loss else 0)
+        
+        if dist.is_primary():
+            for key in losses.keys():
+                losses[key].append(train_loss[key])
+        
+        with open(log_file, "a") as f:
+            writer = csv.writer(f)
+            writer.writerow([epoch + 1] + list(train_loss.values()) + list(val_loss.values()) + (list(adv_val_loss.values()) if adv_val_loss else [None] * 5))
+        
+        if switch_point_detected:
+            if combined_val_loss < best_combined_val_loss:
+                best_combined_val_loss = combined_val_loss
+                patience_counter = 0
+                print(f"Epoch {epoch}: New best model saved with: val_loss: {val_loss["total_loss"]:.4f} | adv_val_loss: {adv_val_loss["total_loss"]:.4f} | combined: {combined_val_loss:.4f}")
+                torch.save(model.state_dict(), f"best_model/svqvae_cd_delayedat_emb256.pt")
+            else:
+                patience_counter += 1
+                print(f"Patience Counter: {patience_counter}/{patience}")
+                
+        
+        if not switch_point_detected:
+            if moving_avg_loss is None:
+                moving_avg_loss = val_loss["total_loss"]
+            else:
+                moving_avg_loss = 0.9 * moving_avg_loss + 0.1 * val_loss["total_loss"]
+
+            if val_loss["total_loss"] < best_val_loss:
+                best_val_loss = val_loss["total_loss"]
+                print(f"Epoch {epoch}: New best model saved with: val_loss {val_loss["total_loss"]:.4f}")
+                torch.save(model.state_dict(), f"best_model/svqvae_cd_delayedat_emb256.pt")
+                
+            if val_loss["total_loss"] > moving_avg_loss and epoch > 20:   # switch to adversarial training at the start of convergence, avoid for big jumps at training initialization during ramp
+                switch_point_detected = True
+                print(f"Switching to adversarial training at epoch {epoch+1}")
+
+        if patience_counter >= patience:
+            print(f"Early stopping at epoch {epoch+1}...")
+            break
+    
+
+    # plot training loss
+    if dist.is_primary():
+        plt.figure(figsize=(10, 6))
+
+        plt.plot(range(1, len(losses["recon_loss"]) + 1), losses["recon_loss"], label="Recon Loss", linestyle="dotted", color="blue")
+        plt.plot(range(1, len(losses["codebook_loss"]) + 1), losses["codebook_loss"], label="Codebook Loss", linestyle="dotted", color="green")
+        plt.plot(range(1, len(losses["commitment_loss"]) + 1), losses["commitment_loss"], label="Commitment Loss", linestyle="dotted", color="purple")
+        plt.plot(range(1, len(losses["class_loss"]) + 1), losses["class_loss"], label="Class Loss", linestyle="dotted", color="orange")
+        plt.plot(range(1, len(losses["divergence_loss"]) + 1), losses["divergence_loss"], label="Divergence Loss", linestyle="dashed", color="brown")
+
+        plt.plot(range(1, len(losses["total_loss"]) + 1), losses["total_loss"], label="Total Loss", linewidth=2, color="red")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.title(f"Training Loss Components DelayedAT(Alpha={args.alpha}, Beta={args.beta}, Gamma={args.gamma})")
+        plt.legend()
+        plt.grid(True)
+        plt.savefig("logs/training_plot_cd_delayedat_emb256.png")
+        plt.show()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--n_gpu", type=int, default=1)
+    parser.add_argument("--dist_url", default="tcp://127.0.0.1:12345")
+    parser.add_argument("--alpha", type=float, default=0.5, help="Weight for VQ-VAE losses vs classification")
+    parser.add_argument("--beta", type=float, default=0.25, help="Commitment loss weight factor")
+    parser.add_argument("--gamma", type=float, default=0.1, help="Max gamma for margin-based divergence penalty")
+    parser.add_argument("--epoch", type=int, default=1000)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--sched", type=str, help="Set to 'cycle' if using CycleScheduler")
+    parser.add_argument("--path", type=str, help="Path to dataset")
+    parser.add_argument("--clip_grad_main", type=float, default=5.0, help="Gradient clip norm for main VQ-VAE + classification losses")
+    parser.add_argument("--clip_grad_diverg", type=float, default=1.0, help="Gradient clip norm for the divergence term")
+    parser.add_argument("--ramp_start", type=int, default=0, help="Epoch at which to begin ramping gamma from 0")
+    parser.add_argument("--ramp_epochs", type=int, default=10, help="How many epochs to go from gamma=0 to gamma=(--gamma)")
+
+    args = parser.parse_args()
+    main(args)
